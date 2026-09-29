@@ -1,0 +1,383 @@
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 4fee3989b2d337a0956eeba459a7a8d1d3e0d942..62d0df94e076c02fc3d64237685104c50f1a55a0 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -900,6 +900,9 @@
+             "local_thread_store_shared_compression": {
+               "type": "boolean"
+             },
++            "luna_max_subagent_fast": {
++              "type": "boolean"
++            },
+             "mcp_2026_07_28": {
+               "type": "boolean"
+             },
+@@ -6803,6 +6806,9 @@
+         "local_thread_store_shared_compression": {
+           "type": "boolean"
+         },
++        "luna_max_subagent_fast": {
++          "type": "boolean"
++        },
+         "mcp_2026_07_28": {
+           "type": "boolean"
+         },
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 0c48988892a6b3623f4c9a892e23e1dbe7933af6..9b81c33937ea21a804baf5c0ff56c26fda248432 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -3802,10 +3802,26 @@ impl Session {
+             turn_context.session_source,
+             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+         ) {
+-            let root_service_tier = self.services.agent_control.service_tier();
+-            if settings.selected().service_tier != root_service_tier {
++            let service_tier = if self.features.enabled(Feature::LunaMaxSubagentFast)
++                && settings.model_info.slug == "gpt-6-luna"
++                && settings.effective_reasoning_effort() == Some(ReasoningEffortConfig::Max)
++            {
++                let priority = ServiceTier::Fast.request_value();
++                if !self.features.enabled(Feature::FastMode)
++                    || !settings.model_info.supports_service_tier(priority)
++                {
++                    return Err(CodexErr::InvalidRequest(
++                        "Luna Max subagent Fast requires FastMode and advertised priority support; this request is blocked"
++                            .to_string(),
++                    ));
++                }
++                Some(priority.to_string())
++            } else {
++                self.services.agent_control.service_tier()
++            };
++            if settings.selected().service_tier != service_tier {
+                 let mut selected = settings.selected().clone();
+-                selected.service_tier = root_service_tier;
++                selected.service_tier = service_tier;
+                 let mut inherited_settings = ResolvedStepSettings::new(
+                     Arc::new(selected),
+                     Arc::clone(&settings.model_info),
+diff --git a/codex-rs/core/tests/suite/subagent_service_tier.rs b/codex-rs/core/tests/suite/subagent_service_tier.rs
+index 74d55925402c93872b3811e3b1ab2f1f82e468fc..4b7117f9b9c0353a90b2d713931d410b2a51b335 100644
+--- a/codex-rs/core/tests/suite/subagent_service_tier.rs
++++ b/codex-rs/core/tests/suite/subagent_service_tier.rs
+@@ -6,7 +6,12 @@ use codex_core::config::AgentRoleConfig;
+ use codex_core::config::Config;
+ use codex_features::Feature;
+ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
++use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::openai_models::ModelServiceTier;
++use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::openai_models::ReasoningEffortPreset;
+ use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::ThreadSettingsOverrides;
+ use codex_protocol::user_input::UserInput;
+@@ -19,6 +24,7 @@ use core_test_support::responses::mount_sse_once_match;
+ use core_test_support::responses::sse;
+ use core_test_support::responses::start_mock_server;
+ use core_test_support::submit_thread_settings;
++use core_test_support::test_codex::TestCodexBuilder;
+ use core_test_support::test_codex::test_codex;
+ use core_test_support::wait_for_event;
+ use core_test_support::wait_for_event_match;
+@@ -93,9 +99,9 @@ async fn mount_root_collaboration_call(
+     prompt: &'static str,
+     call_id: &'static str,
+     arguments: serde_json::Value,
+-) {
++) -> ResponseMock {
+     let response_id = format!("root-{call_id}");
+-    mount_sse_once_match(
++    let initial_request = mount_sse_once_match(
+         server,
+         move |request: &wiremock::Request| {
+             body_contains(request, prompt) && !body_contains(request, call_id)
+@@ -126,6 +132,8 @@ async fn mount_root_collaboration_call(
+         ]),
+     )
+     .await;
++
++    initial_request
+ }
+ 
+ async fn mount_completed_child(
+@@ -395,3 +403,252 @@ async fn evicted_role_subagent_uses_root_service_tier_after_reload() -> Result<(
+ 
+     Ok(())
+ }
++
++// These are synthetic fixtures for a local mock server, not an account catalog or aliases.
++fn configure_luna_fast_mock_model(model: &mut ModelInfo) {
++    model.multi_agent_version = Some(MultiAgentVersion::V2);
++    model.default_reasoning_level = Some(ReasoningEffort::High);
++    model.supported_reasoning_levels = [
++        ReasoningEffort::Low,
++        ReasoningEffort::High,
++        ReasoningEffort::Max,
++    ]
++    .into_iter()
++    .map(|effort| ReasoningEffortPreset {
++        description: format!("Mock {effort:?}"),
++        effort,
++    })
++    .collect();
++    model.service_tiers = vec![ModelServiceTier {
++        id: "priority".to_string(),
++        name: "Mock priority".to_string(),
++        description: "Local test capability only".to_string(),
++    }];
++}
++
++fn luna_fast_test_builder() -> TestCodexBuilder {
++    test_codex()
++        .with_model_info_override("gpt-6-luna", configure_luna_fast_mock_model)
++        .with_model_info_override("gpt-6-sol", configure_luna_fast_mock_model)
++        .with_model_info_override("gpt-6-astra", configure_luna_fast_mock_model)
++        .with_config(|config| {
++            for feature in [
++                Feature::Collab,
++                Feature::MultiAgentV2,
++                Feature::FastMode,
++                Feature::LunaMaxSubagentFast,
++            ] {
++                config
++                    .features
++                    .enable(feature)
++                    .expect("enable test feature");
++            }
++            config.model_reasoning_effort = Some(ReasoningEffort::High);
++            config.service_tier = Some("default".to_string());
++            config.agent_default_subagent_model = Some("gpt-6-luna".to_string());
++            config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Max);
++            config.multi_agent_v2.max_concurrent_threads_per_session = 2;
++            config.model_provider.request_max_retries = Some(0);
++            config.model_provider.stream_max_retries = Some(0);
++        })
++}
++
++#[test_case(Some(("gpt-6-luna", "max")), true, Some("priority"); "luna max")]
++#[test_case(None, true, Some("priority"); "default luna max")]
++#[test_case(Some(("gpt-6-sol", "low")), true, None; "sol low unchanged")]
++#[test_case(Some(("gpt-6-sol", "high")), true, None; "sol high unchanged")]
++#[test_case(Some(("gpt-6-luna", "high")), true, None; "other effort unchanged")]
++#[test_case(Some(("gpt-6-luna", "max")), false, None; "feature disabled")]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn luna_max_subagent_fast_is_isolated(
++    child_selection: Option<(&str, &str)>,
++    enabled: bool,
++    expected_tier: Option<&str>,
++) -> Result<()> {
++    let server = start_mock_server().await;
++    let test = luna_fast_test_builder()
++        .with_config(move |config| {
++            if !enabled {
++                config
++                    .features
++                    .disable(Feature::LunaMaxSubagentFast)
++                    .expect("disable test feature");
++            }
++        })
++        .build_with_auto_env(&server)
++        .await?;
++    let mut created_threads = test.thread_manager.subscribe_thread_created();
++    let mut arguments = json!({
++        "message": CHILD_PROMPT,
++        "task_name": "isolated",
++        "fork_turns": "none",
++    });
++    if let Some((model, effort)) = child_selection {
++        arguments["model"] = json!(model);
++        arguments["reasoning_effort"] = json!(effort);
++    }
++    let root_request =
++        mount_root_collaboration_call(&server, ROOT_PROMPT, SPAWN_CALL_ID, arguments).await;
++    let initial_request = mount_completed_child(&server, CHILD_PROMPT, ROOT_PROMPT).await;
++    test.submit_text_turn(ROOT_PROMPT).await?;
++    let child_id = created_threads.recv().await?;
++    let child = test.thread_manager.get_thread(child_id).await?;
++    wait_for_turn_complete(&child).await;
++    assert_request_service_tier(&root_request, /*expected*/ None);
++    assert_request_service_tier(&initial_request, expected_tier);
++    let (model, effort) = child_selection.unwrap_or(("gpt-6-luna", "max"));
++    let body = initial_request.single_request().body_json();
++    assert_eq!(
++        (
++            body["model"].as_str(),
++            body.pointer("/reasoning/effort")
++                .and_then(serde_json::Value::as_str),
++        ),
++        (Some(model), Some(effort)),
++    );
++    let root_body = root_request.single_request().body_json();
++    assert_eq!(
++        (
++            root_body["model"].as_str(),
++            root_body
++                .pointer("/reasoning/effort")
++                .and_then(serde_json::Value::as_str),
++        ),
++        (Some("gpt-6-astra"), Some("high")),
++    );
++
++    // A user-selected root change still reaches Sol; Luna's override remains independent.
++    submit_thread_settings(
++        &test.codex,
++        ThreadSettingsOverrides {
++            service_tier: Some(Some("priority".to_string())),
++            ..Default::default()
++        },
++    )
++    .await?;
++    let continued = mount_completed_child(&server, FOLLOWUP_PROMPT, ROOT_PROMPT).await;
++    child
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: FOLLOWUP_PROMPT.to_string(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    wait_for_turn_complete(&child).await;
++    assert_request_service_tier(&continued, Some("priority"));
++    submit_thread_settings(
++        &test.codex,
++        ThreadSettingsOverrides {
++            service_tier: Some(Some("default".to_string())),
++            ..Default::default()
++        },
++    )
++    .await?;
++
++    let compaction = mount_sse_once_match(
++        &server,
++        |request: &wiremock::Request| body_contains(request, "compaction_trigger"),
++        sse(vec![
++            ev_response_created("isolated-compaction"),
++            json!({"type": "response.output_item.done", "item": {
++                "type": "compaction", "encrypted_content": "mock compacted history",
++            }}),
++            ev_completed("isolated-compaction"),
++        ]),
++    )
++    .await;
++    child.submit(Op::Compact).await?;
++    wait_for_turn_complete(&child).await;
++    assert_request_service_tier(&compaction, expected_tier);
++    drop(child);
++
++    // Exercise default dispatch and eviction/reload, without selecting another backend.
++    let fresh_root = mount_root_collaboration_call(
++        &server,
++        FRESH_ROOT_PROMPT,
++        FRESH_SPAWN_CALL_ID,
++        json!({"message": FRESH_CHILD_PROMPT, "task_name": "fresh", "fork_turns": "none"}),
++    )
++    .await;
++    let fresh_request = mount_completed_child(&server, FRESH_CHILD_PROMPT, FRESH_ROOT_PROMPT).await;
++    test.submit_text_turn(FRESH_ROOT_PROMPT).await?;
++    let fresh_id = created_threads.recv().await?;
++    let fresh = test.thread_manager.get_thread(fresh_id).await?;
++    wait_for_turn_complete(&fresh).await;
++    assert_request_service_tier(&fresh_root, /*expected*/ None);
++    assert_request_service_tier(&fresh_request, enabled.then_some("priority"));
++    drop(fresh);
++    assert!(test.thread_manager.get_thread(child_id).await.is_err());
++    test.thread_manager
++        .ensure_multi_agent_v2_child_loaded(child_id)
++        .await?;
++    let reloaded = test.thread_manager.get_thread(child_id).await?;
++    let reload_prompt = "finish the reloaded isolated worker";
++    let reload_request = mount_completed_child(&server, reload_prompt, ROOT_PROMPT).await;
++    reloaded
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: reload_prompt.to_string(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    wait_for_turn_complete(&reloaded).await;
++    assert_request_service_tier(&reload_request, expected_tier);
++    let snapshot = test.codex.config_snapshot().await;
++    assert_eq!(
++        (snapshot.service_tier.as_deref(), snapshot.reasoning_effort),
++        (Some("default"), Some(ReasoningEffort::High)),
++    );
++    reloaded.shutdown_and_wait().await?;
++    test.codex.shutdown_and_wait().await?;
++    Ok(())
++}
++
++#[test_case("capability"; "priority not advertised")]
++#[test_case("feature"; "fast mode disabled")]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn luna_max_subagent_fast_rejects_unavailable(gate: &str) -> Result<()> {
++    let server = start_mock_server().await;
++    let mut builder = luna_fast_test_builder();
++    if gate == "capability" {
++        builder = builder
++            .with_model_info_override("gpt-6-luna", |model| model.service_tiers.clear())
++            .with_model("gpt-6-astra");
++    } else {
++        builder = builder.with_config(|config| {
++            config
++                .features
++                .disable(Feature::FastMode)
++                .expect("disable test feature");
++        });
++    }
++    let test = builder.build_with_auto_env(&server).await?;
++    let mut created_threads = test.thread_manager.subscribe_thread_created();
++    mount_root_collaboration_call(
++        &server,
++        ROOT_PROMPT,
++        SPAWN_CALL_ID,
++        json!({
++            "message": CHILD_PROMPT, "task_name": "unavailable", "fork_turns": "none",
++            "model": "gpt-6-luna", "reasoning_effort": "max",
++        }),
++    )
++    .await;
++    test.submit_text_turn(ROOT_PROMPT).await?;
++    let child_id = created_threads.recv().await?;
++    let child = test.thread_manager.get_thread(child_id).await?;
++    wait_for_event_match(child.as_ref(), |event| match event {
++        EventMsg::Error(error) => {
++            assert!(error.message.contains("Luna Max subagent Fast requires"));
++            Some(())
++        }
++        EventMsg::TurnComplete(_) => panic!("missing unsupported-Fast error"),
++        _ => None,
++    })
++    .await;
++    let requests = server.received_requests().await.expect("mock request log");
++    assert!(!requests.iter().any(|request| {
++        body_contains(request, CHILD_PROMPT) && !body_contains(request, ROOT_PROMPT)
++    }));
++    child.shutdown_and_wait().await?;
++    test.codex.shutdown_and_wait().await?;
++    Ok(())
++}
+diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
+index 5ea619d0ab8b7bc3f9e5d54dcd3acadd342cecb7..ec4f90b59ed61702b2bf8e644cf72b3109006bd2 100644
+--- a/codex-rs/features/src/lib.rs
++++ b/codex-rs/features/src/lib.rs
+@@ -359,6 +359,8 @@ pub enum Feature {
+     Artifact,
+     /// Enable Fast mode selection in the TUI and request layer.
+     FastMode,
++    /// Opt in to independent priority routing for GPT-6 Luna Max work subagents.
++    LunaMaxSubagentFast,
+     /// Enable explicitly requested model changes for later step captures.
+     StepModelSwitching,
+     /// Enable voice conversations in the TUI.
+@@ -1752,6 +1754,12 @@ pub const FEATURES: &[FeatureSpec] = &[
+         stage: Stage::Stable,
+         default_enabled: true,
+     },
++    FeatureSpec {
++        id: Feature::LunaMaxSubagentFast,
++        key: "luna_max_subagent_fast",
++        stage: Stage::UnderDevelopment,
++        default_enabled: false,
++    },
+     FeatureSpec {
+         id: Feature::StepModelSwitching,
+         key: "step_model_switching",
